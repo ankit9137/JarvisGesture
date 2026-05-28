@@ -736,21 +736,50 @@
   }
 
   // ---------- rAF loop ----------
+  function anyWidgetVisible() {
+    for (var i = 0; i < WIDGET_IDS.length; i++) {
+      var w = widgets[WIDGET_IDS[i]];
+      if (w && !w.el.classList.contains('jd-hidden')) return true;
+    }
+    return false;
+  }
+
+  var lastSlow = 0;
+  var lastMusic = 0;
   function loop() {
     if (typeof document !== 'undefined' && document.hidden) {
       rafId = 0;
       return;
     }
+    // Skip entirely when no widget is on screen — saves huge CPU
+    if (!anyWidgetVisible()) {
+      rafId = 0;
+      setTimeout(function () { if (!rafId) rafId = requestAnimationFrame(loop); }, 250);
+      return;
+    }
     var now = Date.now();
-    if (now - lastTick > 80) {
-      lastTick = now;
+    // slow updates @ 4 Hz
+    if (now - lastSlow > 250) {
+      lastSlow = now;
       tickClock();
       tickStats();
       tickWeather(now);
+    }
+    // music bars @ 20 Hz (smooth but cheap)
+    if (now - lastMusic > 50) {
+      lastMusic = now;
       tickMusic();
     }
     rafId = requestAnimationFrame(loop);
   }
+
+  // Restart loop when toggleAllWidgets shows widgets
+  var _origToggle = toggleAllWidgets;
+  toggleAllWidgets = function () {
+    _origToggle();
+    if (!rafId) rafId = requestAnimationFrame(loop);
+  };
+  window.JarvisDashboard = { toggleAll: toggleAllWidgets };
 
   if (typeof document !== 'undefined') {
     document.addEventListener('visibilitychange', function () {

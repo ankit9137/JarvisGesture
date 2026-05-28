@@ -181,10 +181,10 @@ function initMediaPipe() {
 
   handsModel.setOptions({
     maxNumHands: 2,
-    modelComplexity: 1,
+    modelComplexity: 0,           // 0 = lite model ~3x faster than 1, still solid for gestures
     minDetectionConfidence: 0.55,
-    minTrackingConfidence: 0.50,
-    selfieMode: true,  // tell MediaPipe the input is selfie/mirrored
+    minTrackingConfidence: 0.45,
+    selfieMode: true,
   });
 
   handsModel.onResults(onHandResults);
@@ -330,8 +330,8 @@ function startCamera(videoEl, handsInstance, onReady) {
     onFrame: async () => {
       await handsInstance.send({ image: videoEl });
     },
-    width: 1280,
-    height: 720,
+    width: 960,
+    height: 540,
   });
   cameraUtil.start().then(() => {
     if (onReady) onReady();
