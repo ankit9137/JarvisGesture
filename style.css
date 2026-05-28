@@ -116,8 +116,24 @@ html, body {
   position: absolute; inset: 0;
   width: 100%; height: 100%;
   transform: scaleX(-1);   /* mirror so it feels natural */
-  opacity: 0.22;
+  opacity: 0.95;
+  filter: saturate(1.1) contrast(1.05);
   z-index: 0;
+}
+
+/* ===== CLUTTER REMOVAL =====
+   Hide legacy static panels — dashboard widgets now cover the same ground
+   and the user wanted a cleaner stage. */
+.side-panel,
+.left-panel,
+.right-panel,
+#center-panel,
+#demo-buttons,
+#action-log,
+#scroll-zone,
+#jd-ticker,
+#jd-tray {
+  display: none !important;
 }
 
 /* ---- Corner decorations ---- */

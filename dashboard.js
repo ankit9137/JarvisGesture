@@ -608,8 +608,14 @@
   }
 
   function restoreState() {
+    // NEW BEHAVIOR: widgets are HIDDEN by default for a clean stage.
+    // User toggles them via the 🖥 button (built below) or the 'H' key.
+    var anyExplicit = false;
     for (var i = 0; i < WIDGET_IDS.length; i++) {
-      var id = WIDGET_IDS[i];
+      if (lsGet(LS_HIDDEN + WIDGET_IDS[i]) !== null) { anyExplicit = true; break; }
+    }
+    for (var j = 0; j < WIDGET_IDS.length; j++) {
+      var id = WIDGET_IDS[j];
       var w = widgets[id]; if (!w) continue;
       var saved = safeJSON(lsGet(LS_POS + id));
       if (saved && saved.left && saved.top) {
@@ -620,15 +626,36 @@
       } else {
         applyDefaultPos(id);
       }
-      if (lsGet(LS_HIDDEN + id) === 'true') {
+      // Default to hidden unless user has explicitly toggled state before
+      var hidden = anyExplicit ? (lsGet(LS_HIDDEN + id) === 'true') : true;
+      if (hidden) {
         w.el.classList.add('jd-hidden');
-        addTrayIcon(id);
       } else {
         w.el.classList.remove('jd-hidden');
-        removeTrayIcon(id);
       }
     }
   }
+
+  function toggleAllWidgets() {
+    // If any visible → hide all; if all hidden → show all
+    var anyVisible = false;
+    for (var i = 0; i < WIDGET_IDS.length; i++) {
+      var w = widgets[WIDGET_IDS[i]];
+      if (w && !w.el.classList.contains('jd-hidden')) { anyVisible = true; break; }
+    }
+    for (var j = 0; j < WIDGET_IDS.length; j++) {
+      var id = WIDGET_IDS[j];
+      var w2 = widgets[id]; if (!w2) continue;
+      if (anyVisible) {
+        w2.el.classList.add('jd-hidden');
+        lsSet(LS_HIDDEN + id, 'true');
+      } else {
+        w2.el.classList.remove('jd-hidden');
+        lsSet(LS_HIDDEN + id, 'false');
+      }
+    }
+  }
+  window.JarvisDashboard = { toggleAll: toggleAllWidgets };
 
   function minimizeWidget(id) {
     var w = widgets[id]; if (!w) return;
@@ -756,21 +783,47 @@
     document.body.appendChild(trayEl.el);
   }
 
+  function buildToggleBtn() {
+    var b = document.createElement('button');
+    b.id = 'jd-toggle';
+    b.type = 'button';
+    b.textContent = '🖥 WIDGETS';
+    b.style.cssText = 'position:fixed;top:60px;right:140px;z-index:9998;background:rgba(0,20,35,0.85);'
+      + 'border:1px solid rgba(0,212,255,0.6);color:#00d4ff;font-family:"Courier New",monospace;'
+      + 'font-size:11px;padding:6px 10px;cursor:pointer;letter-spacing:1.5px;'
+      + 'box-shadow:0 0 8px rgba(0,212,255,0.4);';
+    b.addEventListener('mouseenter', function () {
+      b.style.background = 'rgba(0,212,255,0.3)'; b.style.color = '#fff';
+    });
+    b.addEventListener('mouseleave', function () {
+      b.style.background = 'rgba(0,20,35,0.85)'; b.style.color = '#00d4ff';
+    });
+    b.addEventListener('click', function (e) { e.stopPropagation(); toggleAllWidgets(); });
+    document.body.appendChild(b);
+  }
+
   function init() {
     mountWidgets();
     restoreState();
+    buildToggleBtn();
     rafId = requestAnimationFrame(loop);
+    // 'H' key toggles widgets
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'h' || e.key === 'H') {
+        if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
+        toggleAllWidgets();
+      }
+    });
     waitForBrain(function (ok) {
       if (ok) {
         wireBrain();
-        brainSay('🖥 Dashboard online');
-        pushTickerItem('DASHBOARD ONLINE • 6 WIDGETS ACTIVE');
+        brainSay('🖥 Dashboard ready — press H or click 🖥 WIDGETS to toggle');
       } else {
         console.warn('[Dashboard] JarvisBrain not detected after 3s — feed events disabled');
       }
     });
     if (typeof console !== 'undefined' && console.log) {
-      console.log('🖥 JARVIS Dashboard online — 8 widgets mounted');
+      console.log('🖥 JARVIS Dashboard online — widgets hidden by default. Press H to toggle.');
     }
   }
 
