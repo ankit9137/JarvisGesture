@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>JARVIS — Gesture Control</title>
+  <link rel="stylesheet" href="style.css" />
+
+  <!-- MediaPipe Hands via CDN (no install needed) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+  <!-- ===== BOOT SCREEN ===== -->
+  <div id="boot-screen">
+    <div class="boot-logo">
+      <svg width="80" height="80" viewBox="0 0 80 80">
+        <circle cx="40" cy="40" r="36" stroke="#00d4ff" stroke-width="2" fill="none" opacity="0.6"/>
+        <circle cx="40" cy="40" r="26" stroke="#00d4ff" stroke-width="1" fill="none" opacity="0.4"/>
+        <circle cx="40" cy="40" r="6" fill="#00d4ff"/>
+        <line x1="40" y1="4" x2="40" y2="20" stroke="#00d4ff" stroke-width="2"/>
+        <line x1="40" y1="60" x2="40" y2="76" stroke="#00d4ff" stroke-width="2"/>
+        <line x1="4" y1="40" x2="20" y2="40" stroke="#00d4ff" stroke-width="2"/>
+        <line x1="60" y1="40" x2="76" y2="40" stroke="#00d4ff" stroke-width="2"/>
+      </svg>
+    </div>
+    <div class="boot-title">J.A.R.V.I.S</div>
+    <div class="boot-sub">Just A Rather Very Intelligent System</div>
+    <div class="boot-log" id="boot-log">
+      <div>► Initializing neural interface...</div>
+    </div>
+    <button class="boot-btn" id="start-btn" onclick="startSystem()">
+      ► ACTIVATE GESTURE CONTROL
+    </button>
+  </div>
+
+  <!-- ===== MAIN HUD ===== -->
+  <div id="hud" class="hidden">
+
+    <!-- Camera Feed (hidden, used for processing) -->
+    <video id="cam" autoplay playsinline muted></video>
+
+    <!-- Mirrored canvas showing camera + hand landmarks -->
+    <canvas id="output-canvas"></canvas>
+
+    <!-- TOP BAR -->
+    <div class="hud-topbar">
+      <div class="hud-logo">⬡ JARVIS</div>
+      <div class="hud-status">
+        <span class="dot" id="cam-dot"></span> CAM
+        <span class="dot" id="track-dot"></span> TRACKING
+        <span class="dot" id="gest-dot"></span> GESTURE
+      </div>
+      <div class="hud-time" id="hud-time">00:00:00</div>
+    </div>
+
+    <!-- GESTURE CURSOR (follows index finger) -->
+    <div id="gesture-cursor">
+      <div class="cursor-ring"></div>
+      <div class="cursor-dot"></div>
+    </div>
+    <div id="click-ripple" class="hidden"></div>
+
+    <!-- GESTURE NAME DISPLAY -->
+    <div id="gesture-label">
+      <span id="gesture-name">–</span>
+    </div>
+
+    <!-- LEFT PANEL — hand info -->
+    <div class="side-panel left-panel">
+      <div class="panel-title">◈ HAND DATA</div>
+      <div class="panel-row"><span class="lbl">Hand</span><span id="info-hand">–</span></div>
+      <div class="panel-row"><span class="lbl">Fingers</span><span id="info-fingers">–</span></div>
+      <div class="panel-row"><span class="lbl">Gesture</span><span id="info-gesture">–</span></div>
+      <div class="panel-row"><span class="lbl">Confidence</span><span id="info-conf">–</span></div>
+      <div class="panel-row"><span class="lbl">FPS</span><span id="info-fps">–</span></div>
+    </div>
+
+    <!-- RIGHT PANEL — gesture guide -->
+    <div class="side-panel right-panel">
+      <div class="panel-title">◈ GESTURE MAP</div>
+      <div class="gesture-item" id="gi-cursor">☝️ <b>INDEX UP</b> — Move cursor</div>
+      <div class="gesture-item" id="gi-click">🤏 <b>PINCH</b> — Click</div>
+      <div class="gesture-item" id="gi-scroll">✌️ <b>PEACE</b> — Scroll</div>
+      <div class="gesture-item" id="gi-fist">✊ <b>FIST</b> — Pause/Stop</div>
+      <div class="gesture-item" id="gi-open">🖐️ <b>OPEN PALM</b> — Reset</div>
+      <div class="gesture-item" id="gi-ok">👌 <b>OK SIGN</b> — Select</div>
+      <div class="gesture-item" id="gi-rock">🤘 <b>ROCK</b> — Mode switch</div>
+      <div class="gesture-item" id="gi-point">👉 <b>POINT RIGHT</b> — Next</div>
+    </div>
+
+    <!-- CENTER DEMO PANEL — interactive content -->
+    <div id="center-panel">
+      <div class="panel-title" style="font-size:13px; margin-bottom:16px;">◈ GESTURE DEMO ZONE</div>
+
+      <div id="demo-buttons">
+        <div class="demo-btn" id="db1" data-id="1">⚡ POWER</div>
+        <div class="demo-btn" id="db2" data-id="2">🌐 NETWORK</div>
+        <div class="demo-btn" id="db3" data-id="3">🛡️ SHIELD</div>
+        <div class="demo-btn" id="db4" data-id="4">🔊 AUDIO</div>
+        <div class="demo-btn" id="db5" data-id="5">📡 SIGNAL</div>
+        <div class="demo-btn" id="db6" data-id="6">🧠 AI CORE</div>
+      </div>
+
+      <div id="action-log">
+        <div class="log-title">ACTION LOG</div>
+        <div id="log-entries"></div>
+      </div>
+
+      <div id="scroll-zone">
+        <div class="scroll-content" id="scroll-content">
+          <p>► System online. All diagnostics nominal.</p>
+          <p>► Gesture control interface active.</p>
+          <p>► Point index finger to move cursor.</p>
+          <p>► Pinch to click buttons above.</p>
+          <p>► Use Peace sign to scroll this panel.</p>
+          <p>► Open palm resets the cursor.</p>
+          <p>► Rock sign switches between modes.</p>
+          <p>► OK sign selects highlighted item.</p>
+          <p>► Fist pauses gesture detection.</p>
+          <p>► All systems operational. Welcome, Ankit.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- BOTTOM BAR -->
+    <div class="hud-bottombar">
+      <div id="mode-indicator">MODE: <span id="current-mode">CURSOR</span></div>
+      <div id="status-msg" class="status-msg">Initializing camera...</div>
+      <div id="paused-badge" class="hidden">⏸ PAUSED</div>
+    </div>
+
+    <!-- CORNER DECORATIONS -->
+    <div class="corner tl"></div>
+    <div class="corner tr"></div>
+    <div class="corner bl"></div>
+    <div class="corner br"></div>
+
+  </div><!-- /hud -->
+
+  <script src="gesture-engine.js"></script>
+  <script src="ui.js"></script>
+
+  <!-- ===== POWER FEATURES STACK ===== -->
+  <link rel="stylesheet" href="dashboard.css" />
+  <link rel="stylesheet" href="power-features.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+  <script src="jarvis-brain.js"></script>
+  <script src="dashboard.js"></script>
+  <script src="power-features.js"></script>
+
+</body>
+</html>
