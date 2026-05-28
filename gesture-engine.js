@@ -330,8 +330,8 @@ function startCamera(videoEl, handsInstance, onReady) {
     onFrame: async () => {
       await handsInstance.send({ image: videoEl });
     },
-    width: 960,
-    height: 540,
+    width: 640,
+    height: 360,
   });
   cameraUtil.start().then(() => {
     if (onReady) onReady();

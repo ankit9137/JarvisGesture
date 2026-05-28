@@ -249,24 +249,14 @@
     return best;
   }
 
-  function scheduleNext() {
-    rafId = requestAnimationFrame(gestureTick);
-  }
-
+  // setInterval @ 10 Hz instead of rAF — stable-gesture buffer doesn't need 60Hz
   function gestureTick() {
-    if (typeof document !== 'undefined' && document.hidden) {
-      // pause loop while tab hidden — restarted via visibilitychange
-      rafId = 0;
-      return;
-    }
-    if (!window.GestureState) return scheduleNext();
-
+    if (typeof document !== 'undefined' && document.hidden) return;
+    if (!window.GestureState) return;
     var g = window.GestureState.gesture;
     if (typeof g !== 'string' || !g) g = 'NONE';
-
     gestureBuffer.push(g);
     if (gestureBuffer.length > STABLE_BUFFER_SIZE) gestureBuffer.shift();
-
     if (gestureBuffer.length === STABLE_BUFFER_SIZE) {
       var stable = mostFrequent(gestureBuffer);
       if (stable !== lastStable) {
@@ -276,18 +266,11 @@
         }
       }
     }
-    scheduleNext();
   }
 
   function startGestureLoop() {
     if (rafId) return;
-    scheduleNext();
-  }
-
-  if (typeof document !== 'undefined') {
-    document.addEventListener('visibilitychange', function () {
-      if (!document.hidden && !rafId) startGestureLoop();
-    });
+    rafId = setInterval(gestureTick, 100);
   }
 
   // ---------- Public API ----------

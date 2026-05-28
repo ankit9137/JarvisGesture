@@ -1,416 +1,193 @@
 'use strict';
-/* JARVIS Lightning FX v2 — perf-tuned + cursor + shockwave + energy ball
-   - Single rAF loop, idle-skip, adaptive DPR.
-   - Reads window.GestureHands; exposes window.LightningFX for other modules.
-   - Emits CustomEvent 'jarvis:bolt' (detail = {ax,ay,bx,by,power,color}) so
-     stickman.js can detect hits.
-   - Listens for window.GestureState (primary hand gestures): OPEN_PALM push = shockwave,
-     OK = energy ball, INDEX_UP = glowing cursor. */
+/* JARVIS Unified FX — Lightning + Stickman + Perf badge + Hotkeys
+   ONE rAF loop, ONE canvas. Reads window.GestureHands / GestureState.
+   Goals: smooth (single loop), bright dramatic lightning, walking stickman target.
+   Hotkeys: Esc=pause, P=screenshot, R=reset hits, H=widgets toggle. */
 (function () {
-  // ---------- Tunables ----------
-  var SPEED_TRIGGER_SOLO = 280;
-  var MAX_BOLTS_PER_FRAME = 5;
-  var BOLT_LIFE = 200;
-  var SPARK_LIFE = 550;
-  var MAX_SPARKS = 60;
-  var IDLE_SPEED = 25;            // below this on all hands = sleep mode
-  var IDLE_SLEEP_MS = 600;        // sleep delay after going idle
-  var TARGET_FPS = 60;
-  var LOW_FPS_THRESHOLD = 38;     // adaptive trigger
+  // ============================================================
+  //  CONFIG
+  // ============================================================
+  var DPR = Math.min(window.devicePixelRatio || 1, 1.25); // cap for perf
+  var SOLO_SPEED = 360;            // px/sec to trigger solo bolts
+  var BOLT_LIFE = 240;             // ms
+  var MAX_BOLTS = 24;
+  var IDLE_SPEED = 30;
+  var GROUND_Y = 0.86;             // factor of screen height for stickman feet
+  var WALK_SPEED = 130;
+  var HIT_RADIUS = 95;
+  var GRAVITY = 1500;
+  var DAMPING = 0.984;
+  var STIFFNESS = 0.45;
+  var RAGDOLL_RECOVER = 2000;
 
-  // Fingertip / wrist indices
-  var TIPS = [4, 8, 12, 16, 20];
-  var INDEX_TIP = 8, WRIST = 0, MIDDLE_MCP = 9;
-
-  // ---------- State ----------
+  // ============================================================
+  //  STATE
+  // ============================================================
   var canvas, ctx;
   var W = 0, H = 0;
-  var dpr = Math.min(window.devicePixelRatio || 1, 1.5); // cap at 1.5 for perf
+  var paused = false;
+  var screenFlash = 0;       // 0..1, decays each frame
   var bolts = [];
   var sparks = [];
-  var shockwaves = [];   // {x,y,r,maxR,born,life,color,intensity}
-  var energyBalls = [];  // {x,y,radius,charge,born,gesture}
-  var rafId = 0;
-  var lastFrame = 0;
-  var lastActive = 0;
-  var asleep = false;
 
-  // Adaptive perf
-  var fpsAvg = 60;
-  var fpsLastTs = 0;
-  var qualityScale = 1.0;  // 1.0 = max, 0.5 = half-cost
+  // Stickman
+  var IDX = { head:0, neck:1, hip:2, lsh:3, lhand:4, rsh:5, rhand:6, lknee:7, lfoot:8, rknee:9, rfoot:10 };
+  var BONE_LEN = 56;
+  var CONSTRAINTS = [
+    [0,1,0.30],[1,2,0.55],
+    [1,3,0.25],[1,5,0.25],
+    [3,4,0.55],[5,6,0.55],
+    [2,7,0.45],[2,9,0.45],
+    [7,8,0.45],[9,10,0.45]
+  ];
+  var pts = [];
+  var stickState = 'walking'; // walking | ragdoll | recovering
+  var stickStateSince = 0;
+  var stickX = 200, stickFacing = 1, walkPhase = 0;
+  var hits = 0;
 
-  // Cursor (INDEX_UP)
-  var cursor = { x: -100, y: -100, visible: false, glow: 0, pinch: false };
-
-  // Hand-push tracking for OPEN_PALM force gesture
-  var palmZHistory = [];
-
-  // ---------- Boot canvas ----------
+  // ============================================================
+  //  CANVAS
+  // ============================================================
   function ensureCanvas() {
     if (canvas) return;
     canvas = document.createElement('canvas');
-    canvas.id = 'lightning-fx';
-    canvas.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;'
-      + 'pointer-events:none;z-index:25;mix-blend-mode:screen;';
+    canvas.id = 'jarvis-fx';
+    canvas.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;' +
+      'pointer-events:none;z-index:25;';
     document.body.appendChild(canvas);
-    ctx = canvas.getContext('2d');
+    ctx = canvas.getContext('2d', { alpha: true });
     resize();
     window.addEventListener('resize', resize);
   }
-
   function resize() {
     if (!canvas) return;
-    W = window.innerWidth;
-    H = window.innerHeight;
-    canvas.width = Math.round(W * dpr);
-    canvas.height = Math.round(H * dpr);
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = Math.round(W * DPR);
+    canvas.height = Math.round(H * DPR);
     canvas.style.width = W + 'px';
     canvas.style.height = H + 'px';
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    if (pts.length === 0) initStickman();
   }
 
-  // ---------- Bolt generator ----------
+  // ============================================================
+  //  LIGHTNING — bolt generator with BRANCHING (the dramatic part)
+  // ============================================================
   function makeBolt(ax, ay, bx, by, opts) {
     opts = opts || {};
-    var segs = Math.round((opts.segs || 12) * qualityScale);
-    if (segs < 4) segs = 4;
-    var jitter = opts.jitter || 22;
-    var pts = [];
-    var dx = bx - ax, dy = by - ay;
-    var len = Math.sqrt(dx * dx + dy * dy) || 1;
-    var nx = -dy / len, ny = dx / len;
-    for (var i = 0; i <= segs; i++) {
-      var t = i / segs;
-      var taper = Math.sin(t * Math.PI);
-      var j = (Math.random() - 0.5) * jitter * taper;
-      pts.push({ x: ax + dx * t + nx * j, y: ay + dy * t + ny * j });
+    var pwr = opts.power || 1;
+    var segs = opts.segs || (10 + Math.round(pwr * 6));
+    var jitter = opts.jitter || (24 + pwr * 14);
+    var pts0 = subdivide(ax, ay, bx, by, segs, jitter);
+    // Branches: fork off at random midpoints
+    var branches = [];
+    var branchCount = opts.branches != null ? opts.branches : Math.round(1 + pwr * 3);
+    for (var i = 0; i < branchCount; i++) {
+      var idx = 2 + Math.floor(Math.random() * (pts0.length - 4));
+      var bp = pts0[idx];
+      var dx = bx - ax, dy = by - ay;
+      var blen = Math.sqrt(dx * dx + dy * dy);
+      var ang = Math.atan2(dy, dx) + (Math.random() - 0.5) * 1.4;
+      var blen2 = blen * (0.18 + Math.random() * 0.32);
+      var tx = bp.x + Math.cos(ang) * blen2;
+      var ty = bp.y + Math.sin(ang) * blen2;
+      branches.push(subdivide(bp.x, bp.y, tx, ty, 6, jitter * 0.6));
     }
     return {
-      points: pts,
+      main: pts0,
+      branches: branches,
       born: performance.now(),
       life: opts.life || BOLT_LIFE,
-      color: opts.color || '#7df9ff',
-      width: opts.width || 2,
-      power: opts.power || 1
+      color: opts.color || '#9ff0ff',
+      width: opts.width || (2 + pwr * 1.6),
+      power: pwr,
+      flash: opts.flash || 0
     };
+  }
+  function subdivide(ax, ay, bx, by, segs, jit) {
+    var pts0 = [{ x: ax, y: ay }];
+    var dx = bx - ax, dy = by - ay;
+    var nx = -dy, ny = dx;
+    var nlen = Math.sqrt(nx * nx + ny * ny) || 1;
+    nx /= nlen; ny /= nlen;
+    for (var i = 1; i < segs; i++) {
+      var t = i / segs;
+      var taper = Math.sin(t * Math.PI);
+      var j = (Math.random() - 0.5) * jit * taper;
+      pts0.push({ x: ax + dx * t + nx * j, y: ay + dy * t + ny * j });
+    }
+    pts0.push({ x: bx, y: by });
+    return pts0;
   }
 
   function pushBolt(b) {
     bolts.push(b);
-    if (bolts.length > 70) bolts.splice(0, bolts.length - 70);
-    // Tell the world a bolt was fired so stickman.js can detect hits
-    try {
-      var p1 = b.points[0], p2 = b.points[b.points.length - 1];
-      window.dispatchEvent(new CustomEvent('jarvis:bolt', {
-        detail: { ax: p1.x, ay: p1.y, bx: p2.x, by: p2.y, points: b.points, power: b.power, color: b.color }
-      }));
-    } catch (e) { /* ignore */ }
+    if (bolts.length > MAX_BOLTS) bolts.splice(0, bolts.length - MAX_BOLTS);
+    if (b.flash) screenFlash = Math.min(1, screenFlash + b.flash);
+    // hit-test against stickman
+    testStickHit(b);
   }
 
-  function makeSparkBurst(x, y, count, color) {
-    count = Math.round(count * qualityScale);
-    for (var i = 0; i < count; i++) {
-      var angle = Math.random() * Math.PI * 2;
-      var speed = 60 + Math.random() * 200;
+  function makeSparks(x, y, n, color) {
+    for (var i = 0; i < n; i++) {
+      var a = Math.random() * Math.PI * 2;
+      var sp = 80 + Math.random() * 240;
       sparks.push({
         x: x, y: y,
-        vx: Math.cos(angle) * speed,
-        vy: Math.sin(angle) * speed,
-        born: performance.now(),
-        life: SPARK_LIFE * (0.6 + Math.random() * 0.6),
-        color: color || '#9deaff'
+        vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+        born: performance.now(), life: 500 + Math.random() * 400,
+        color: color || '#bff'
       });
     }
-    if (sparks.length > MAX_SPARKS) sparks.splice(0, sparks.length - MAX_SPARKS);
+    if (sparks.length > 80) sparks.splice(0, sparks.length - 80);
   }
 
-  // ---------- Shockwave ----------
-  function spawnShockwave(x, y, intensity) {
-    intensity = intensity || 1;
-    shockwaves.push({
-      x: x, y: y,
-      r: 20, maxR: 320 + intensity * 220,
-      born: performance.now(),
-      life: 700 + intensity * 200,
-      color: intensity > 1.2 ? '#ffe066' : '#a0f0ff',
-      intensity: intensity
-    });
-    makeSparkBurst(x, y, 12, '#ffff99');
-    // Tell stickman about the shockwave for knockback
-    try {
-      window.dispatchEvent(new CustomEvent('jarvis:shockwave', {
-        detail: { x: x, y: y, intensity: intensity, maxR: 320 + intensity * 220 }
-      }));
-    } catch (e) {}
-  }
-
-  function drawShockwave(sw, now) {
-    var age = now - sw.born;
-    var t = age / sw.life;
-    if (t >= 1) return false;
-    sw.r = 20 + (sw.maxR - 20) * t;
-    var alpha = (1 - t) * 0.9;
-    ctx.save();
-    ctx.globalAlpha = alpha;
-    ctx.strokeStyle = sw.color;
-    ctx.shadowColor = sw.color;
-    ctx.shadowBlur = 24;
-    ctx.lineWidth = 4 * (1 - t * 0.4);
+  // ============================================================
+  //  DRAW LIGHTNING — multi-pass for that bright sci-fi look
+  // ============================================================
+  function strokePts(p) {
     ctx.beginPath();
-    ctx.arc(sw.x, sw.y, sw.r, 0, Math.PI * 2);
-    ctx.stroke();
-    // Inner ring
-    ctx.globalAlpha = alpha * 0.55;
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.arc(sw.x, sw.y, sw.r * 0.78, 0, Math.PI * 2);
-    ctx.stroke();
-    ctx.restore();
-    return true;
-  }
-
-  // ---------- Energy ball (OK gesture) ----------
-  function updateEnergyBalls(now) {
-    // Active only if primary hand currently makes OK
-    var gs = window.GestureState;
-    var present = gs && gs.gesture === 'OK' && gs.indexTip;
-    if (present) {
-      if (energyBalls.length === 0) {
-        energyBalls.push({ x: 0, y: 0, radius: 14, charge: 0, born: now });
-      }
-      var ball = energyBalls[0];
-      // Position at palm center (mid index-tip + thumb-tip)
-      var hand = (window.GestureHands || [])[0];
-      if (hand && hand.landmarks) {
-        var tx = (hand.landmarks[4].x + hand.landmarks[8].x) / 2;
-        var ty = (hand.landmarks[4].y + hand.landmarks[8].y) / 2;
-        ball.x = ball.x === 0 ? tx : ball.x + (tx - ball.x) * 0.4;
-        ball.y = ball.y === 0 ? ty : ball.y + (ty - ball.y) * 0.4;
-      }
-      ball.charge = Math.min(1, ball.charge + 0.018);
-      ball.radius = 14 + ball.charge * 26;
-    } else {
-      // Release on let-go: throw a big bolt if fully charged
-      if (energyBalls.length > 0) {
-        var b0 = energyBalls[0];
-        if (b0.charge > 0.6) {
-          // Release as a powerful bolt to the nearest stickman or center
-          var tx2 = W / 2, ty2 = H / 2;
-          if (window.Stickman && window.Stickman.position) {
-            var pos = window.Stickman.position();
-            if (pos) { tx2 = pos.x; ty2 = pos.y; }
-          }
-          pushBolt(makeBolt(b0.x, b0.y, tx2, ty2, {
-            segs: 18, jitter: 38, width: 3.5, power: 3, color: '#ffe066', life: 320
-          }));
-          makeSparkBurst(b0.x, b0.y, 18, '#ffff66');
-          spawnShockwave(b0.x, b0.y, 1.2);
-        }
-        energyBalls.length = 0;
-      }
-    }
-  }
-
-  function drawEnergyBall(b, now) {
-    var t = (now - b.born) / 1000;
-    var pulse = Math.sin(t * 8) * 3;
-    // Outer aura
-    ctx.save();
-    ctx.globalAlpha = 0.35 + b.charge * 0.35;
-    var grad = ctx.createRadialGradient(b.x, b.y, 2, b.x, b.y, b.radius + 20 + pulse);
-    grad.addColorStop(0, '#ffffff');
-    grad.addColorStop(0.3, b.charge > 0.7 ? '#ffe066' : '#7df9ff');
-    grad.addColorStop(1, 'rgba(0,0,0,0)');
-    ctx.fillStyle = grad;
-    ctx.beginPath();
-    ctx.arc(b.x, b.y, b.radius + 20 + pulse, 0, Math.PI * 2);
-    ctx.fill();
-    // Core
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = '#ffffff';
-    ctx.shadowColor = b.charge > 0.7 ? '#ffe066' : '#7df9ff';
-    ctx.shadowBlur = 30;
-    ctx.beginPath();
-    ctx.arc(b.x, b.y, b.radius * 0.45 + pulse * 0.5, 0, Math.PI * 2);
-    ctx.fill();
-    // Internal lightning
-    if (Math.random() < 0.7) {
-      var a = Math.random() * Math.PI * 2;
-      var r1 = b.radius * 0.2;
-      var r2 = b.radius * 0.85;
-      pushBolt(makeBolt(
-        b.x + Math.cos(a) * r1, b.y + Math.sin(a) * r1,
-        b.x + Math.cos(a) * r2, b.y + Math.sin(a) * r2,
-        { segs: 6, jitter: 8, width: 1, life: 90, color: '#ffffff', power: 0.5 }
-      ));
-    }
-    ctx.restore();
-  }
-
-  // ---------- Cursor (INDEX_UP) ----------
-  function updateCursor(now) {
-    var gs = window.GestureState;
-    var show = gs && (gs.gesture === 'INDEX_UP' || gs.gesture === 'PINCH') && gs.indexTip;
-    if (show) {
-      var tx = gs.indexTip.x, ty = gs.indexTip.y;
-      cursor.x = cursor.visible ? cursor.x + (tx - cursor.x) * 0.5 : tx;
-      cursor.y = cursor.visible ? cursor.y + (ty - cursor.y) * 0.5 : ty;
-      cursor.visible = true;
-      cursor.glow = Math.min(1, cursor.glow + 0.1);
-      var nowPinch = gs.gesture === 'PINCH';
-      if (nowPinch && !cursor.pinch) {
-        // Click event
-        makeSparkBurst(cursor.x, cursor.y, 10, '#ffe066');
-        spawnShockwave(cursor.x, cursor.y, 0.5);
-        try {
-          window.dispatchEvent(new CustomEvent('jarvis:click', { detail: { x: cursor.x, y: cursor.y } }));
-        } catch (e) {}
-      }
-      cursor.pinch = nowPinch;
-    } else {
-      cursor.glow *= 0.92;
-      if (cursor.glow < 0.05) cursor.visible = false;
-      cursor.pinch = false;
-    }
-  }
-
-  function drawCursor(now) {
-    if (!cursor.visible && cursor.glow < 0.05) return;
-    var pulse = Math.sin(now / 90) * 2;
-    ctx.save();
-    ctx.globalAlpha = cursor.glow;
-    // Outer ring
-    ctx.strokeStyle = cursor.pinch ? '#ffe066' : '#00ff88';
-    ctx.shadowColor = ctx.strokeStyle;
-    ctx.shadowBlur = 18;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    ctx.arc(cursor.x, cursor.y, 18 + pulse, 0, Math.PI * 2);
-    ctx.stroke();
-    // Inner dot
-    ctx.fillStyle = '#ffffff';
-    ctx.shadowBlur = 12;
-    ctx.beginPath();
-    ctx.arc(cursor.x, cursor.y, 4, 0, Math.PI * 2);
-    ctx.fill();
-    // Cross-hairs
-    ctx.strokeStyle = ctx.shadowColor;
-    ctx.lineWidth = 1;
-    ctx.shadowBlur = 0;
-    var L = 26;
-    ctx.beginPath();
-    ctx.moveTo(cursor.x - L, cursor.y); ctx.lineTo(cursor.x - 22, cursor.y);
-    ctx.moveTo(cursor.x + 22, cursor.y); ctx.lineTo(cursor.x + L, cursor.y);
-    ctx.moveTo(cursor.x, cursor.y - L); ctx.lineTo(cursor.x, cursor.y - 22);
-    ctx.moveTo(cursor.x, cursor.y + 22); ctx.lineTo(cursor.x, cursor.y + L);
-    ctx.stroke();
-    ctx.restore();
-  }
-
-  // ---------- Force push detector (OPEN_PALM thrust toward camera) ----------
-  function detectForcePush() {
-    var hand = (window.GestureHands || [])[0];
-    if (!hand || hand.gesture !== 'OPEN_PALM') {
-      palmZHistory.length = 0;
-      return;
-    }
-    var v = hand.velocity || { speed: 0 };
-    palmZHistory.push(v.speed);
-    if (palmZHistory.length > 8) palmZHistory.shift();
-    // sudden speed spike = push
-    if (palmZHistory.length === 8) {
-      var recent = (palmZHistory[6] + palmZHistory[7]) / 2;
-      var earlier = (palmZHistory[0] + palmZHistory[1] + palmZHistory[2]) / 3;
-      if (recent > 400 && recent > earlier * 2.4) {
-        spawnShockwave(hand.palmCenter.x, hand.palmCenter.y, 1.4);
-        palmZHistory.length = 0; // cooldown
-      }
-    }
-  }
-
-  // ---------- Solo bolts ----------
-  function maybeSoloBolts(hand) {
-    var v = hand.velocity || { speed: 0 };
-    if (v.speed < SPEED_TRIGGER_SOLO) return;
-    var energy = Math.min(1, (v.speed - SPEED_TRIGGER_SOLO) / 700);
-    var count = 1 + Math.round(energy * MAX_BOLTS_PER_FRAME * qualityScale);
-    var lms = hand.landmarks;
-    if (!lms || lms.length < 21) return;
-    for (var i = 0; i < count; i++) {
-      var a = TIPS[(Math.random() * TIPS.length) | 0];
-      var b = Math.random() < 0.5 ? WRIST : TIPS[(Math.random() * TIPS.length) | 0];
-      if (a === b) continue;
-      pushBolt(makeBolt(lms[a].x, lms[a].y, lms[b].x, lms[b].y, {
-        segs: 8, jitter: 14 + energy * 18,
-        width: 1.2 + energy * 1.6,
-        color: energy > 0.55 ? '#ffff77' : '#7df9ff',
-        life: 180 + energy * 200,
-        power: 0.6 + energy * 0.8
-      }));
-    }
-    if (v.speed > 700 && lms[INDEX_TIP]) {
-      makeSparkBurst(lms[INDEX_TIP].x, lms[INDEX_TIP].y, 5, '#ffff99');
-    }
-  }
-
-  // ---------- Dual-hand electricity ----------
-  function dualHandLightning(h1, h2) {
-    var l1 = h1.landmarks, l2 = h2.landmarks;
-    if (!l1 || !l2) return;
-    pushBolt(makeBolt(l1[INDEX_TIP].x, l1[INDEX_TIP].y, l2[INDEX_TIP].x, l2[INDEX_TIP].y, {
-      segs: 14, jitter: 30, width: 2.4, color: '#a0f0ff', life: 160, power: 1.2
-    }));
-    pushBolt(makeBolt(h1.palmCenter.x, h1.palmCenter.y, h2.palmCenter.x, h2.palmCenter.y, {
-      segs: 16, jitter: 40, width: 3.2, color: '#ffff88', life: 200, power: 1.8
-    }));
-    var ta = TIPS[(Math.random() * TIPS.length) | 0];
-    var tb = TIPS[(Math.random() * TIPS.length) | 0];
-    pushBolt(makeBolt(l1[ta].x, l1[ta].y, l2[tb].x, l2[tb].y, {
-      segs: 10, jitter: 20, width: 1.4, color: '#c8eaff', life: 140, power: 0.9
-    }));
-    var dx = h1.palmCenter.x - h2.palmCenter.x;
-    var dy = h1.palmCenter.y - h2.palmCenter.y;
-    var d = Math.sqrt(dx * dx + dy * dy);
-    if (d < 280) {
-      var midX = (h1.palmCenter.x + h2.palmCenter.x) / 2;
-      var midY = (h1.palmCenter.y + h2.palmCenter.y) / 2;
-      makeSparkBurst(midX, midY, 3, '#ffff99');
-    }
-  }
-
-  // ---------- Renderers ----------
-  function strokePath(pts) {
-    ctx.beginPath();
-    ctx.moveTo(pts[0].x, pts[0].y);
-    for (var i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.moveTo(p[0].x, p[0].y);
+    for (var i = 1; i < p.length; i++) ctx.lineTo(p[i].x, p[i].y);
     ctx.stroke();
   }
 
   function drawBolt(b, now) {
     var age = now - b.born;
+    if (age >= b.life) return false;
     var t = age / b.life;
-    if (t >= 1) return false;
     var alpha = 1 - t;
+    var W0 = b.width;
+
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
-    // Outer glow
-    ctx.strokeStyle = b.color;
+
+    // PASS 1 — wide haze
     ctx.shadowColor = b.color;
-    ctx.shadowBlur = 18;
-    ctx.globalAlpha = alpha * 0.5;
-    ctx.lineWidth = b.width + 6;
-    strokePath(b.points);
-    // Mid
+    ctx.shadowBlur = 28;
+    ctx.strokeStyle = b.color;
+    ctx.globalAlpha = alpha * 0.35;
+    ctx.lineWidth = W0 + 14;
+    strokePts(b.main);
+    for (var i = 0; i < b.branches.length; i++) strokePts(b.branches[i]);
+
+    // PASS 2 — bright color glow
+    ctx.shadowBlur = 14;
     ctx.globalAlpha = alpha * 0.85;
-    ctx.lineWidth = b.width + 2;
-    strokePath(b.points);
-    // Core
+    ctx.lineWidth = W0 + 4;
+    strokePts(b.main);
+    for (var j = 0; j < b.branches.length; j++) strokePts(b.branches[j]);
+
+    // PASS 3 — white-hot core
     ctx.shadowBlur = 0;
     ctx.strokeStyle = '#ffffff';
     ctx.globalAlpha = alpha;
-    ctx.lineWidth = Math.max(1, b.width - 0.5);
-    strokePath(b.points);
+    ctx.lineWidth = Math.max(1.4, W0 * 0.55);
+    strokePts(b.main);
+    ctx.lineWidth = Math.max(1, W0 * 0.35);
+    for (var k = 0; k < b.branches.length; k++) strokePts(b.branches[k]);
+
     return true;
   }
 
@@ -418,148 +195,404 @@
     var age = now - s.born;
     if (age >= s.life) return false;
     var t = age / s.life;
-    s.x += s.vx * (dt / 1000);
-    s.y += s.vy * (dt / 1000);
-    s.vx *= 0.94;
-    s.vy = s.vy * 0.94 + 280 * (dt / 1000);
+    s.x += s.vx * dt; s.y += s.vy * dt;
+    s.vx *= 0.93;
+    s.vy = s.vy * 0.93 + 380 * dt;
     ctx.globalAlpha = 1 - t;
     ctx.fillStyle = s.color;
     ctx.shadowColor = s.color;
-    ctx.shadowBlur = 8;
+    ctx.shadowBlur = 10;
     ctx.beginPath();
-    ctx.arc(s.x, s.y, 2.2 * (1 - t * 0.6), 0, Math.PI * 2);
+    ctx.arc(s.x, s.y, 2.4 * (1 - t * 0.5), 0, Math.PI * 2);
     ctx.fill();
     return true;
   }
 
-  function drawEnergyRing(hand, now) {
+  // ============================================================
+  //  HAND-DRIVEN BOLTS
+  // ============================================================
+  var TIPS = [4, 8, 12, 16, 20];
+  function handBolts(hand) {
+    var v = hand.velocity || { speed: 0 };
+    if (v.speed < SOLO_SPEED) return;
+    var energy = Math.min(1, (v.speed - SOLO_SPEED) / 800);
+    var lms = hand.landmarks;
+    if (!lms || lms.length < 21) return;
+    // ONE dramatic bolt per frame (not many) — looks better than spam
+    var a = TIPS[(Math.random() * TIPS.length) | 0];
+    var b = TIPS[(Math.random() * TIPS.length) | 0];
+    if (a === b) b = 0; // wrist
+    pushBolt(makeBolt(lms[a].x, lms[a].y, lms[b].x, lms[b].y, {
+      power: 0.8 + energy * 1.2,
+      color: energy > 0.5 ? '#ffe14d' : '#7df2ff',
+      branches: 2 + Math.round(energy * 3),
+      flash: energy > 0.7 ? 0.15 : 0,
+      life: 220 + energy * 120
+    }));
+    if (energy > 0.6 && lms[8]) {
+      makeSparks(lms[8].x, lms[8].y, 5, '#ffec80');
+    }
+  }
+
+  function dualBolts(h1, h2) {
+    var l1 = h1.landmarks, l2 = h2.landmarks;
+    if (!l1 || !l2) return;
+    // Index→Index huge bolt
+    pushBolt(makeBolt(l1[8].x, l1[8].y, l2[8].x, l2[8].y, {
+      power: 2.2, color: '#a0f0ff', branches: 5, life: 200, flash: 0.18
+    }));
+    // Distance check — close hands burst sparks
+    var dx = h1.palmCenter.x - h2.palmCenter.x;
+    var dy = h1.palmCenter.y - h2.palmCenter.y;
+    var d = Math.sqrt(dx * dx + dy * dy);
+    if (d < 260) {
+      var mx = (h1.palmCenter.x + h2.palmCenter.x) / 2;
+      var my = (h1.palmCenter.y + h2.palmCenter.y) / 2;
+      makeSparks(mx, my, 4, '#fffacd');
+    }
+  }
+
+  // Energy ring at palm — small, cheap, scales with speed
+  function drawPalmRing(hand, now) {
     var p = hand.palmCenter;
     if (!p) return;
-    var speed = hand.velocity ? hand.velocity.speed : 0;
-    var e = Math.min(1, speed / 800);
-    var baseR = 36 + e * 30;
-    var pulse = Math.sin(now / 130) * 4;
-    var r = baseR + pulse;
+    var v = hand.velocity ? hand.velocity.speed : 0;
+    var e = Math.min(1, v / 700);
+    var r = 32 + e * 22 + Math.sin(now / 140) * 3;
     ctx.save();
-    ctx.globalAlpha = 0.35 + e * 0.45;
-    ctx.strokeStyle = e > 0.4 ? '#ffff66' : '#00d4ff';
+    ctx.globalAlpha = 0.4 + e * 0.4;
+    ctx.strokeStyle = e > 0.4 ? '#ffd84d' : '#00d4ff';
     ctx.shadowColor = ctx.strokeStyle;
-    ctx.shadowBlur = 20;
-    ctx.lineWidth = 1.5 + e * 2;
+    ctx.shadowBlur = 18;
+    ctx.lineWidth = 2 + e * 1.5;
     ctx.beginPath();
     ctx.arc(p.x, p.y, r, 0, Math.PI * 2);
     ctx.stroke();
     ctx.restore();
   }
 
-  // ---------- Adaptive quality ----------
-  function updateFps(now) {
-    if (fpsLastTs) {
-      var dt = now - fpsLastTs;
-      if (dt > 0) {
-        var inst = 1000 / dt;
-        fpsAvg = fpsAvg * 0.92 + inst * 0.08;
-      }
-    }
-    fpsLastTs = now;
-    if (fpsAvg < LOW_FPS_THRESHOLD && qualityScale > 0.5) qualityScale -= 0.02;
-    else if (fpsAvg > 55 && qualityScale < 1.0) qualityScale += 0.01;
-    // Expose for HUD
-    if (!window.PerfStats) window.PerfStats = {};
-    window.PerfStats.fps = Math.round(fpsAvg);
-    window.PerfStats.quality = qualityScale;
+  // ============================================================
+  //  STICKMAN
+  // ============================================================
+  function bodyLen(u) { return u * BONE_LEN; }
+
+  function targetSkeleton(cx, gy) {
+    var t = walkPhase;
+    var sw = Math.sin(t) * 18;
+    var lift = Math.max(0, Math.sin(t)) * 14;
+    var armL = -Math.sin(t) * 30;
+    var armR = Math.sin(t) * 30;
+    var hipY = gy - bodyLen(0.9);
+    var neckY = hipY - bodyLen(0.55);
+    var headY = neckY - bodyLen(0.3);
+    var shx = bodyLen(0.22), hpx = bodyLen(0.16);
+    var ts = [];
+    ts[0]  = { x: cx,        y: headY };
+    ts[1]  = { x: cx,        y: neckY };
+    ts[2]  = { x: cx,        y: hipY };
+    ts[3]  = { x: cx - shx,  y: neckY + 4 };
+    ts[4]  = { x: cx - shx + armL, y: neckY + bodyLen(0.55) };
+    ts[5]  = { x: cx + shx,  y: neckY + 4 };
+    ts[6]  = { x: cx + shx + armR, y: neckY + bodyLen(0.55) };
+    ts[7]  = { x: cx - hpx,  y: hipY + bodyLen(0.45) - lift };
+    ts[8]  = { x: cx - hpx + sw, y: gy };
+    ts[9]  = { x: cx + hpx,  y: hipY + bodyLen(0.45) - Math.max(0, -Math.sin(t)) * 14 };
+    ts[10] = { x: cx + hpx - sw, y: gy };
+    return ts;
   }
 
-  // ---------- Main loop ----------
-  function loop() {
-    if (document.hidden) { rafId = 0; return; }
-    var now = performance.now();
-    updateFps(now);
+  function initStickman() {
+    var gy = H * GROUND_Y;
+    var ts = targetSkeleton(stickX, gy);
+    pts = [];
+    for (var i = 0; i < 11; i++) {
+      pts.push({ x: ts[i].x, y: ts[i].y, px: ts[i].x, py: ts[i].y });
+    }
+  }
 
-    var dt = lastFrame ? Math.min(64, now - lastFrame) : 16;
+  function updateWalking(dt) {
+    walkPhase += dt * 7;
+    stickX += stickFacing * WALK_SPEED * dt;
+    if (stickX > W - 80) { stickX = W - 80; stickFacing = -1; }
+    if (stickX < 80) { stickX = 80; stickFacing = 1; }
+    var gy = H * GROUND_Y;
+    var ts = targetSkeleton(stickX, gy);
+    for (var i = 0; i < pts.length; i++) {
+      pts[i].x += (ts[i].x - pts[i].x) * 0.38;
+      pts[i].y += (ts[i].y - pts[i].y) * 0.38;
+      pts[i].px = pts[i].x;
+      pts[i].py = pts[i].y;
+    }
+  }
+
+  function updateRagdoll(dt) {
+    var gy = H * GROUND_Y + 8;
+    for (var i = 0; i < pts.length; i++) {
+      var p = pts[i];
+      var vx = (p.x - p.px) * DAMPING;
+      var vy = (p.y - p.py) * DAMPING + GRAVITY * dt * dt;
+      p.px = p.x; p.py = p.y;
+      p.x += vx; p.y += vy;
+      if (p.y > gy) {
+        p.y = gy;
+        p.py = p.y + vy * 0.45;
+        p.px = p.x - vx * 0.7;
+      }
+      if (p.x < 10) { p.x = 10; p.px = p.x + (p.x - p.px) * 0.5; }
+      if (p.x > W - 10) { p.x = W - 10; p.px = p.x + (p.x - p.px) * 0.5; }
+    }
+    // Constraint solver — 3 iterations is plenty
+    for (var iter = 0; iter < 3; iter++) {
+      for (var c = 0; c < CONSTRAINTS.length; c++) {
+        var A = pts[CONSTRAINTS[c][0]];
+        var B = pts[CONSTRAINTS[c][1]];
+        var rest = bodyLen(CONSTRAINTS[c][2]);
+        var dx = B.x - A.x, dy = B.y - A.y;
+        var d = Math.sqrt(dx * dx + dy * dy) || 0.001;
+        var diff = (d - rest) / d * STIFFNESS;
+        var ox = dx * diff * 0.5, oy = dy * diff * 0.5;
+        A.x += ox; A.y += oy;
+        B.x -= ox; B.y -= oy;
+      }
+    }
+  }
+
+  function testStickHit(b) {
+    if (stickState === 'recovering') return;
+    var pts0 = b.main;
+    for (var i = 0; i < pts.length; i++) {
+      var p = pts[i];
+      for (var s = 0; s < pts0.length - 1; s++) {
+        var a = pts0[s], b1 = pts0[s + 1];
+        var dx = b1.x - a.x, dy = b1.y - a.y;
+        var len2 = dx * dx + dy * dy;
+        var t = 0;
+        if (len2 > 0) {
+          t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len2;
+          if (t < 0) t = 0; else if (t > 1) t = 1;
+        }
+        var cx = a.x + dx * t, cy = a.y + dy * t;
+        var ddx = p.x - cx, ddy = p.y - cy;
+        if (ddx * ddx + ddy * ddy < HIT_RADIUS * HIT_RADIUS) {
+          // HIT!
+          hits++;
+          updateBadge();
+          // Impulse along bolt direction
+          var bdx = pts0[pts0.length-1].x - pts0[0].x;
+          var bdy = pts0[pts0.length-1].y - pts0[0].y;
+          var bL = Math.sqrt(bdx*bdx+bdy*bdy) || 1;
+          var pwr = (b.power || 1) * 26;
+          p.px -= (bdx/bL) * pwr;
+          p.py -= (bdy/bL) * pwr - 6;
+          stickState = 'ragdoll';
+          stickStateSince = performance.now();
+          makeSparks(p.x, p.y, 14, '#ffec80');
+          screenFlash = Math.min(1, screenFlash + 0.25);
+          if (window.JarvisBrain && window.JarvisBrain.say) {
+            window.JarvisBrain.say('⚡ Zap! Hit #' + hits);
+          }
+          return;
+        }
+      }
+    }
+  }
+
+  function maybeRecover(now) {
+    if (stickState !== 'ragdoll') return;
+    var settled = true;
+    for (var i = 0; i < pts.length; i++) {
+      var p = pts[i];
+      if (Math.abs(p.x - p.px) + Math.abs(p.y - p.py) > 0.6) { settled = false; break; }
+    }
+    if (settled && now - stickStateSince > RAGDOLL_RECOVER) {
+      stickState = 'recovering';
+      stickStateSince = now;
+      stickX = pts[2].x;
+      if (stickX < 100) { stickX = 100; stickFacing = 1; }
+      else if (stickX > W - 100) { stickX = W - 100; stickFacing = -1; }
+    }
+    if (stickState === 'recovering') {
+      var gy = H * GROUND_Y;
+      var ts = targetSkeleton(stickX, gy);
+      for (var j = 0; j < pts.length; j++) {
+        pts[j].x += (ts[j].x - pts[j].x) * 0.2;
+        pts[j].y += (ts[j].y - pts[j].y) * 0.2;
+        pts[j].px = pts[j].x;
+        pts[j].py = pts[j].y;
+      }
+      if (now - stickStateSince > 800) {
+        stickState = 'walking';
+        walkPhase = 0;
+      }
+    }
+  }
+
+  function drawStickman() {
+    ctx.save();
+    var glow = stickState === 'ragdoll' ? '#ff5566' :
+               stickState === 'recovering' ? '#ffe066' : '#00d4ff';
+    ctx.strokeStyle = glow;
+    ctx.shadowColor = glow;
+    ctx.shadowBlur = 14;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.lineWidth = 4;
+    function L(i, j) {
+      ctx.beginPath();
+      ctx.moveTo(pts[i].x, pts[i].y);
+      ctx.lineTo(pts[j].x, pts[j].y);
+      ctx.stroke();
+    }
+    L(1,2); L(1,3); L(3,4); L(1,5); L(5,6);
+    L(2,7); L(7,8); L(2,9); L(9,10);
+    // Head
+    ctx.fillStyle = 'rgba(0,18,32,0.95)';
+    var hr = bodyLen(0.18);
+    ctx.beginPath();
+    ctx.arc(pts[0].x, pts[0].y, hr, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+    // Eyes
+    ctx.shadowBlur = 6;
+    ctx.fillStyle = stickState === 'ragdoll' ? '#ff5566' : '#00ff88';
+    var eo = hr * 0.4, ey = pts[0].y - hr * 0.1;
+    ctx.beginPath();
+    ctx.arc(pts[0].x - eo, ey, 2, 0, Math.PI * 2);
+    ctx.arc(pts[0].x + eo, ey, 2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // ============================================================
+  //  PERF BADGE + HOTKEYS
+  // ============================================================
+  var badge = null;
+  var fpsAvg = 60;
+  var lastFpsTs = 0;
+  function ensureBadge() {
+    if (badge) return;
+    badge = document.createElement('div');
+    badge.style.cssText = 'position:fixed;bottom:50px;left:14px;z-index:9996;' +
+      'background:rgba(0,20,35,0.85);border:1px solid rgba(0,212,255,0.6);' +
+      'color:#00ff88;font-family:"Courier New",monospace;font-size:11px;' +
+      'padding:4px 10px;letter-spacing:1.5px;box-shadow:0 0 8px rgba(0,212,255,0.4);' +
+      'pointer-events:none;';
+    badge.textContent = 'FPS:-- HITS:0';
+    document.body.appendChild(badge);
+  }
+  function updateBadge() {
+    if (!badge) return;
+    var color = fpsAvg > 50 ? '#00ff88' : fpsAvg > 32 ? '#ffe066' : '#ff5566';
+    badge.style.color = color;
+    badge.textContent = 'FPS:' + Math.round(fpsAvg) + ' HITS:' + hits;
+  }
+  var pauseOverlay = null;
+  function ensurePauseOverlay() {
+    if (pauseOverlay) return;
+    pauseOverlay = document.createElement('div');
+    pauseOverlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,0.5);' +
+      'z-index:99999;display:none;align-items:center;justify-content:center;' +
+      'color:#ff5566;font-family:"Courier New",monospace;font-size:42px;' +
+      'letter-spacing:8px;text-shadow:0 0 24px #ff5566;pointer-events:none;';
+    pauseOverlay.textContent = '⏸ PAUSED — ESC TO RESUME';
+    document.body.appendChild(pauseOverlay);
+  }
+  function togglePause() {
+    paused = !paused;
+    if (window.GestureState) window.GestureState.paused = paused;
+    if (pauseOverlay) pauseOverlay.style.display = paused ? 'flex' : 'none';
+  }
+  function resetHits() {
+    hits = 0;
+    stickState = 'walking';
+    stickStateSince = performance.now();
+    initStickman();
+    updateBadge();
+  }
+
+  document.addEventListener('keydown', function (e) {
+    if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
+    if (e.key === 'Escape') { e.preventDefault(); togglePause(); }
+    else if (e.key === 'r' || e.key === 'R') { e.preventDefault(); resetHits(); }
+    else if (e.key === 'p' || e.key === 'P') {
+      e.preventDefault();
+      if (window.html2canvas) {
+        window.html2canvas(document.body).then(function (c) {
+          var a = document.createElement('a');
+          a.href = c.toDataURL('image/png');
+          a.download = 'jarvis-' + Date.now() + '.png';
+          a.click();
+        }).catch(function () {});
+      }
+    }
+  });
+
+  // ============================================================
+  //  MAIN LOOP — single rAF, drives everything
+  // ============================================================
+  var lastFrame = 0;
+  var rafId = 0;
+  function loop() {
+    if (document.hidden || paused) { rafId = 0; return; }
+    var now = performance.now();
+    var dt = lastFrame ? Math.min(0.05, (now - lastFrame) / 1000) : 0.016;
     lastFrame = now;
 
-    var hands = window.GestureHands || [];
-
-    // Idle detection — sleep when nothing is happening
-    var anyFastHand = false;
-    for (var i = 0; i < hands.length; i++) {
-      if (hands[i] && hands[i].velocity && hands[i].velocity.speed > IDLE_SPEED) { anyFastHand = true; break; }
+    // FPS calc
+    if (lastFpsTs) {
+      var instant = 1000 / (now - lastFpsTs);
+      fpsAvg = fpsAvg * 0.92 + instant * 0.08;
     }
-    var hasFX = bolts.length || sparks.length || shockwaves.length || energyBalls.length || cursor.visible;
-    if (anyFastHand || hands.length >= 2 || hasFX) {
-      lastActive = now;
-      asleep = false;
-    } else if (now - lastActive > IDLE_SLEEP_MS) {
-      asleep = true;
-    }
+    lastFpsTs = now;
+    if (Math.random() < 0.05) updateBadge();
 
-    // Even when asleep, fully clear once then schedule the next check less aggressively
-    if (asleep) {
+    // Clear — full clear is FASTER than trail-fade on most GPUs at this DPR
+    ctx.clearRect(0, 0, W, H);
+
+    // Screen flash overlay (white tint) — decays
+    if (screenFlash > 0.01) {
       ctx.save();
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = 'rgba(255,255,255,' + (screenFlash * 0.25) + ')';
+      ctx.fillRect(0, 0, W, H);
       ctx.restore();
-      // poll less often when asleep
-      setTimeout(function () {
-        rafId = requestAnimationFrame(loop);
-      }, 80);
-      return;
+      screenFlash *= 0.78;
     }
 
-    // Trailing fade
-    ctx.save();
-    ctx.setTransform(1, 0, 0, 1, 0, 0);
-    ctx.globalCompositeOperation = 'destination-out';
-    ctx.fillStyle = 'rgba(0,0,0,' + (0.35 * qualityScale + 0.1) + ')';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.restore();
+    // ---- Stickman update + draw ----
+    if (stickState === 'walking') updateWalking(dt);
+    else if (stickState === 'ragdoll') updateRagdoll(dt);
+    maybeRecover(now);
+    drawStickman();
 
-    ctx.globalCompositeOperation = 'lighter';
-
-    // Per-hand FX
-    for (var h = 0; h < hands.length; h++) {
-      var hand = hands[h];
-      if (!hand || !hand.landmarks) continue;
-      drawEnergyRing(hand, now);
-      maybeSoloBolts(hand);
+    // ---- Hand-driven FX ----
+    var hands = window.GestureHands || [];
+    ctx.globalCompositeOperation = 'lighter'; // additive — makes bolts glow
+    for (var i = 0; i < hands.length; i++) {
+      var h = hands[i];
+      if (!h || !h.landmarks) continue;
+      drawPalmRing(h, now);
+      handBolts(h);
     }
+    if (hands.length >= 2) dualBolts(hands[0], hands[1]);
 
-    if (hands.length >= 2) dualHandLightning(hands[0], hands[1]);
-
-    detectForcePush();
-    updateCursor(now);
-    updateEnergyBalls(now);
-
-    // Draw shockwaves
-    var liveSw = [];
-    for (var s = 0; s < shockwaves.length; s++) {
-      if (drawShockwave(shockwaves[s], now)) liveSw.push(shockwaves[s]);
-    }
-    shockwaves = liveSw;
-
-    // Draw energy balls
-    for (var eb = 0; eb < energyBalls.length; eb++) drawEnergyBall(energyBalls[eb], now);
-
-    // Draw bolts
-    var liveBolts = [];
+    // ---- Draw bolts ----
+    var live = [];
     for (var b = 0; b < bolts.length; b++) {
-      if (drawBolt(bolts[b], now)) liveBolts.push(bolts[b]);
+      if (drawBolt(bolts[b], now)) live.push(bolts[b]);
     }
-    bolts = liveBolts;
+    bolts = live;
 
-    // Draw sparks
-    var liveSparks = [];
-    for (var sp = 0; sp < sparks.length; sp++) {
-      if (drawSpark(sparks[sp], now, dt)) liveSparks.push(sparks[sp]);
+    // ---- Sparks ----
+    var liveS = [];
+    for (var s = 0; s < sparks.length; s++) {
+      if (drawSpark(sparks[s], now, dt)) liveS.push(sparks[s]);
     }
-    sparks = liveSparks;
+    sparks = liveS;
 
-    // Cursor on top
-    drawCursor(now);
-
+    ctx.globalCompositeOperation = 'source-over';
     ctx.globalAlpha = 1;
     ctx.shadowBlur = 0;
+
     rafId = requestAnimationFrame(loop);
   }
 
@@ -568,33 +601,35 @@
     rafId = requestAnimationFrame(loop);
   }
 
-  if (typeof document !== 'undefined') {
-    document.addEventListener('visibilitychange', function () {
-      if (!document.hidden && !rafId) start();
-    });
-  }
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden && !rafId && !paused) start();
+  });
 
   function init() {
     ensureCanvas();
+    ensureBadge();
+    ensurePauseOverlay();
+    initStickman();
+    updateBadge();
     start();
-    if (typeof console !== 'undefined' && console.log) {
-      console.log('⚡ Lightning FX v2 online — adaptive, cursor + shockwave + energy ball');
+    if (typeof console !== 'undefined') {
+      console.log('⚡ JARVIS Unified FX — single-loop, lightning + stickman + hotkeys');
     }
   }
 
-  if (typeof document !== 'undefined') {
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', init);
-    } else {
-      setTimeout(init, 0);
-    }
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    setTimeout(init, 0);
   }
 
   // Public API
   window.LightningFX = {
     bolt: function (ax, ay, bx, by, opts) { ensureCanvas(); pushBolt(makeBolt(ax, ay, bx, by, opts)); },
-    sparks: function (x, y, n, color) { ensureCanvas(); makeSparkBurst(x, y, n || 12, color); },
-    shockwave: function (x, y, intensity) { ensureCanvas(); spawnShockwave(x, y, intensity); },
-    cursorPos: function () { return cursor.visible ? { x: cursor.x, y: cursor.y } : null; }
+    sparks: function (x, y, n, color) { ensureCanvas(); makeSparks(x, y, n || 12, color); }
+  };
+  window.Stickman = {
+    reset: resetHits,
+    hits: function () { return hits; }
   };
 })();
